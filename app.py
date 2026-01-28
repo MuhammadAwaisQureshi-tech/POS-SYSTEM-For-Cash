@@ -68,6 +68,7 @@ def create_app():
         "http://127.0.0.1:8081",
         "http://127.0.0.1:5173",
         "https://zahid-cms.vercel.app",
+        "https://zahid-cms-cash.vercel.app",
     ]
     
     # Simplified and more reliable CORS configuration
