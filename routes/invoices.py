@@ -262,7 +262,7 @@ def create_invoice():
         # Generate ZATCA QR code
         try:
             # ZATCA Phase-1 required data
-            seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
             vat_number = "314265267200003"
             invoice_datetime = format_datetime(now)
             total_amount_str = format_amount(total_amount)
@@ -312,7 +312,7 @@ def list_invoices():
         invoices = list(collection.find().sort("created_at", -1))
         
         # ZATCA Phase-1 required data (fixed for this company)
-        seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+        seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
         vat_number = "314265267200003"
         
         result = []
@@ -374,7 +374,7 @@ def get_invoice_qr(invoice_id):
 
         try:
             # ZATCA Phase-1 required data
-            seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
             vat_number = "314265267200003"
             created_at = datetime.fromisoformat(invoice.get("created_at", "").replace("Z", ""))
             invoice_datetime = format_datetime(created_at)
@@ -599,7 +599,7 @@ def create_invoice_cash():
         # Generate ZATCA QR code
         try:
             # ZATCA Phase-1 required data
-            seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
             vat_number = "314265267200003"
             invoice_datetime = format_datetime(now)
             total_amount_str = format_amount(total_amount)
@@ -649,7 +649,7 @@ def list_invoices_cash():
         invoices = list(collection.find().sort("created_at", -1))
         
         # ZATCA Phase-1 required data (fixed for this company)
-        seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+        seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
         vat_number = "314265267200003"
         
         result = []
