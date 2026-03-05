@@ -231,3 +231,43 @@ def search_customer_by_name():
     except Exception as e:
         error_msg = str(e)
         return jsonify({"error": f"Failed to search customer: {error_msg}"}), 500
+
+
+@customers_bp.get("/api/customers/by-vat-id")
+def get_customer_by_vat_id():
+    """
+    Get a customer by exact VAT ID match.
+    
+    Query parameters:
+        - user_id: User ID (required)
+        - vat_id: Customer VAT ID to search (required, exact match)
+    
+    Returns:
+        Customer object or empty object if not found
+    """
+    try:
+        user_id = request.args.get("user_id", "")
+        vat_id = request.args.get("vat_id", "").strip()
+        
+        if not user_id:
+            return jsonify({"error": "user_id query parameter is required"}), 400
+        if not vat_id:
+            return jsonify({"error": "vat_id query parameter is required"}), 400
+        
+        collection = get_collection("customers")
+        
+        # Find customer by exact VAT ID match
+        customer = collection.find_one({
+            "user_id": user_id,
+            "customer_vat_id": vat_id
+        })
+        
+        if customer:
+            customer = convert_objectid_to_str(customer)
+            return jsonify(customer), 200
+        else:
+            return jsonify({}), 200  # Return empty object if not found
+            
+    except Exception as e:
+        error_msg = str(e)
+        return jsonify({"error": f"Failed to search customer by VAT ID: {error_msg}"}), 500
