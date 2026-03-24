@@ -2,12 +2,18 @@
 Account Analysis routes for managing daily account records.
 All account analysis operations interact with MongoDB database.
 """
-from flask import Blueprint, request, jsonify
+import os
+from flask import Blueprint, request, jsonify, Response
+from werkzeug.utils import secure_filename
 from mongodb_client import get_collection
 from bson import ObjectId
-from datetime import datetime, timedelta
-from typing import Any
-from collections import defaultdict
+from bson.binary import Binary
+from datetime import datetime
+from typing import Any, Optional, Tuple
+
+# Invoice files stored as BSON Binary on the document (MongoDB doc limit 16MB).
+MAX_PURCHASE_INVOICE_BYTES = 10 * 1024 * 1024
+ALLOWED_INVOICE_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 
 # Create a Blueprint for account analysis routes
 account_analysis_bp = Blueprint('account_analysis', __name__)
@@ -28,6 +34,50 @@ def convert_objectid_to_str(obj: Any) -> Any:
     return obj
 
 
+def daily_record_to_json(doc: Optional[dict]) -> Optional[dict]:
+    """Serialize a daily record for JSON responses (never embed binary file data)."""
+    if doc is None:
+        return None
+    d = dict(doc)
+    has_invoice = bool(d.get("purchase_invoice_data"))
+    d.pop("purchase_invoice_data", None)
+    d = convert_objectid_to_str(d)
+    d["has_purchase_invoice"] = has_invoice
+    return d
+
+
+def _parse_invoice_upload(file_storage) -> Optional[dict]:
+    """Validate and read uploaded invoice file; returns fields for $set or None if no file."""
+    if file_storage is None or file_storage.filename is None or file_storage.filename.strip() == "":
+        return None
+    data = file_storage.read()
+    if len(data) > MAX_PURCHASE_INVOICE_BYTES:
+        raise ValueError(f"Invoice file too large (max {MAX_PURCHASE_INVOICE_BYTES // (1024 * 1024)}MB)")
+    ext = os.path.splitext(file_storage.filename)[1].lower()
+    if ext not in ALLOWED_INVOICE_EXTENSIONS:
+        raise ValueError(
+            "Invalid invoice file type. Allowed: " + ", ".join(sorted(ALLOWED_INVOICE_EXTENSIONS))
+        )
+    safe_name = secure_filename(file_storage.filename) or "invoice"
+    return {
+        "purchase_invoice_filename": safe_name,
+        "purchase_invoice_content_type": file_storage.content_type or "application/octet-stream",
+        "purchase_invoice_data": Binary(data),
+    }
+
+
+def _load_daily_record(collection, record_id: str) -> Tuple[Any, Optional[dict]]:
+    """Resolve ObjectId and return (obj_id, doc) or (None, None) if not found."""
+    try:
+        obj_id = ObjectId(record_id)
+    except Exception:
+        return None, None
+    record = collection.find_one({"_id": obj_id})
+    if not record:
+        return None, None
+    return obj_id, record
+
+
 @account_analysis_bp.post("/api/account-analysis/daily-record")
 def create_daily_record():
     """
@@ -46,11 +96,21 @@ def create_daily_record():
     
     Returns:
         Created daily record object with 201 status code
+    
+    Accepts application/json or multipart/form-data (use field name purchase_invoice for the file).
     """
-    try:
-        payload = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "Invalid JSON"}), 400
+    payload = {}
+    invoice_file = None
+    # Use mimetype (normalized lowercase); substring match on content_type fails for
+    # "Multipart/form-data" from some clients/browsers.
+    if request.mimetype == "multipart/form-data":
+        payload = {k: request.form.get(k) for k in request.form}
+        invoice_file = request.files.get("purchase_invoice")
+    else:
+        try:
+            payload = request.get_json(force=True) or {}
+        except Exception:
+            return jsonify({"error": "Invalid JSON"}), 400
 
     # Extract and validate required fields
     user_id = payload.get("user_id")
@@ -59,7 +119,8 @@ def create_daily_record():
     total_bank = payload.get("total_bank")
     total_purchase_amount = payload.get("total_purchase_amount")
     purchase_company_name = payload.get("purchase_company_name")
-    notes = payload.get("notes", "")
+    notes = payload.get("notes") or ""
+    company_phone = (payload.get("company_phone") or "").strip()
 
     # Validate required fields
     if not user_id:
@@ -98,10 +159,22 @@ def create_daily_record():
         "total_bank": total_bank,
         "total_purchase_amount": total_purchase_amount,
         "purchase_company_name": purchase_company_name,
+        "company_phone": company_phone,
         "notes": notes,
+        "purchase_invoice_filename": None,
+        "purchase_invoice_content_type": None,
+        "purchase_invoice_data": None,
         "created_at": now.isoformat(),
-        "updated_at": now.isoformat()
+        "updated_at": now.isoformat(),
     }
+
+    try:
+        if invoice_file is not None:
+            inv = _parse_invoice_upload(invoice_file)
+            if inv:
+                daily_record_doc.update(inv)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
 
     try:
         collection = get_collection("account_analysis_daily")
@@ -114,9 +187,8 @@ def create_daily_record():
 
         # Fetch the created record
         created_record = collection.find_one({"_id": result.inserted_id})
-        created_record = convert_objectid_to_str(created_record)
         
-        return jsonify(created_record), 201
+        return jsonify(daily_record_to_json(created_record)), 201
         
     except Exception as e:
         error_msg = str(e)
@@ -163,8 +235,7 @@ def list_daily_records():
         cursor = collection.find(filter_query).sort("date", -1)
         records = list(cursor)
         
-        # Convert ObjectId to string
-        records = convert_objectid_to_str(records)
+        records = [daily_record_to_json(r) for r in records]
         
         return jsonify(records)
         
@@ -198,14 +269,63 @@ def get_daily_record(record_id):
         if not record:
             return jsonify({"error": "Daily record not found"}), 404
         
-        # Convert ObjectId to string
-        record = convert_objectid_to_str(record)
-        
-        return jsonify(record)
+        return jsonify(daily_record_to_json(record))
         
     except Exception as e:
         error_msg = str(e)
         return jsonify({"error": f"Failed to fetch daily record: {error_msg}"}), 500
+
+
+@account_analysis_bp.get("/api/account-analysis/daily-records/<record_id>/purchase-invoice")
+def download_purchase_invoice(record_id):
+    """Download the stored purchase invoice file (binary from MongoDB)."""
+    try:
+        collection = get_collection("account_analysis_daily")
+        obj_id, record = _load_daily_record(collection, record_id)
+        if not record:
+            return jsonify({"error": "Daily record not found"}), 404
+        raw = record.get("purchase_invoice_data")
+        if not raw:
+            return jsonify({"error": "No purchase invoice attached"}), 404
+        filename = record.get("purchase_invoice_filename") or "invoice"
+        ctype = record.get("purchase_invoice_content_type") or "application/octet-stream"
+        # raw may be Binary or bytes
+        data = bytes(raw) if raw is not None else b""
+        return Response(
+            data,
+            mimetype=ctype,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "private, max-age=0",
+            },
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to download invoice: {str(e)}"}), 500
+
+
+@account_analysis_bp.post("/api/account-analysis/daily-records/<record_id>/purchase-invoice")
+def upload_purchase_invoice(record_id):
+    """Attach or replace the purchase invoice on an existing daily record."""
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "file is required"}), 400
+        inv = _parse_invoice_upload(request.files["file"])
+        if not inv:
+            return jsonify({"error": "No file selected"}), 400
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+
+    try:
+        collection = get_collection("account_analysis_daily")
+        obj_id, record = _load_daily_record(collection, record_id)
+        if not record:
+            return jsonify({"error": "Daily record not found"}), 404
+        inv["updated_at"] = datetime.utcnow().isoformat()
+        collection.update_one({"_id": obj_id}, {"$set": inv})
+        updated = collection.find_one({"_id": obj_id})
+        return jsonify(daily_record_to_json(updated)), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to upload invoice: {str(e)}"}), 500
 
 
 @account_analysis_bp.put("/api/account-analysis/daily-records/<record_id>")
@@ -218,7 +338,7 @@ def update_daily_record(record_id):
     
     Allowed fields to update:
         - total_cash_sale, total_bank, total_purchase_amount
-        - purchase_company_name, notes
+        - purchase_company_name, company_phone, notes
     
     Returns:
         Updated daily record object
@@ -229,9 +349,11 @@ def update_daily_record(record_id):
         # Only allow specific fields to be updated
         allowed = {
             "total_cash_sale", "total_bank", "total_purchase_amount",
-            "purchase_company_name", "notes"
+            "purchase_company_name", "company_phone", "notes"
         }
         update = {k: data[k] for k in allowed if k in data}
+        if "company_phone" in update and update["company_phone"] is not None:
+            update["company_phone"] = str(update["company_phone"]).strip()
         
         if not update:
             return jsonify({"error": "No valid fields to update"}), 400
@@ -263,9 +385,8 @@ def update_daily_record(record_id):
         
         # Fetch updated record
         updated_record = collection.find_one({"_id": obj_id})
-        updated_record = convert_objectid_to_str(updated_record)
         
-        return jsonify(updated_record)
+        return jsonify(daily_record_to_json(updated_record))
         
     except Exception as e:
         error_msg = str(e)
