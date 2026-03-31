@@ -3,6 +3,7 @@ Account Analysis routes for managing daily account records.
 All account analysis operations interact with MongoDB database.
 """
 import json
+import math
 import os
 from flask import Blueprint, request, jsonify, Response
 from werkzeug.utils import secure_filename
@@ -18,6 +19,34 @@ ALLOWED_INVOICE_EXTENSIONS = {".pdf"}
 
 # Create a Blueprint for account analysis routes
 account_analysis_bp = Blueprint('account_analysis', __name__)
+
+
+def _parse_finite_amount(raw: Any, label: str) -> float:
+    """Parse a required numeric field; reject NaN, infinity, and non-numeric values."""
+    if raw is None:
+        raise ValueError(f"{label} is required")
+    if isinstance(raw, str) and not raw.strip():
+        raise ValueError(f"{label} is required")
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a valid number")
+    if math.isnan(x) or math.isinf(x):
+        raise ValueError(f"{label} must be a finite number")
+    return x
+
+
+def _sanitize_daily_record_amount_fields(d: dict) -> None:
+    """Ensure JSON responses never contain NaN/inf (invalid in standard JSON)."""
+    for key in ("total_cash_sale", "total_bank", "total_purchase_amount"):
+        if key not in d:
+            continue
+        v = d.get(key)
+        try:
+            x = float(v)
+            d[key] = x if math.isfinite(x) else 0.0
+        except (TypeError, ValueError):
+            d[key] = 0.0
 
 
 def convert_objectid_to_str(obj: Any) -> Any:
@@ -61,10 +90,13 @@ def daily_record_to_json(doc: Optional[dict]) -> Optional[dict]:
     if doc is None:
         return None
     d = dict(doc)
+    _sanitize_daily_record_amount_fields(d)
     companies_raw = d.get("purchase_companies")
     companies_out: list[dict] = []
 
-    if companies_raw and isinstance(companies_raw, list) and len(companies_raw) > 0:
+    if isinstance(companies_raw, list) and len(companies_raw) == 0:
+        d.pop("purchase_invoice_data", None)
+    elif companies_raw and isinstance(companies_raw, list) and len(companies_raw) > 0:
         for c in companies_raw:
             if not isinstance(c, dict):
                 continue
@@ -122,8 +154,10 @@ def _parse_purchase_companies_meta(payload: dict) -> list[dict]:
             arr = pc_raw
         else:
             raise ValueError("purchase_companies must be a JSON array")
-        if not isinstance(arr, list) or len(arr) < 1:
-            raise ValueError("At least one purchase company is required")
+        if not isinstance(arr, list):
+            raise ValueError("purchase_companies must be a JSON array")
+        if len(arr) == 0:
+            return []
         out: list[dict] = []
         for i, row in enumerate(arr):
             if not isinstance(row, dict):
@@ -185,9 +219,10 @@ def create_daily_record():
         - total_cash_sale: Total cash sales amount
         - total_bank: Total bank amount
         - total_purchase_amount: Total purchase amount
-        - purchase_company_name: Name of the purchase company
     
     Optional fields:
+        - purchase_companies: JSON array of suppliers (may be empty [])
+        - purchase_company_name / company_phone: legacy single-row fields
         - notes: Additional notes or comments
     
     Returns:
@@ -238,16 +273,22 @@ def create_daily_record():
     except ValueError as ve:
         return jsonify({"error": str(ve)}), 400
 
-    purchase_company_name = companies_meta[0]["purchase_company_name"]
-    company_phone = companies_meta[0]["company_phone"]
+    if companies_meta:
+        purchase_company_name = companies_meta[0]["purchase_company_name"]
+        company_phone = companies_meta[0]["company_phone"]
+    else:
+        purchase_company_name = ""
+        company_phone = ""
 
-    # Validate and convert amounts
+    # Validate and convert amounts (reject NaN / inf — they break JSON responses)
     try:
-        total_cash_sale = float(total_cash_sale)
-        total_bank = float(total_bank)
-        total_purchase_amount = float(total_purchase_amount)
-    except (TypeError, ValueError):
-        return jsonify({"error": "Amounts must be valid numbers"}), 400
+        total_cash_sale = _parse_finite_amount(total_cash_sale, "total_cash_sale")
+        total_bank = _parse_finite_amount(total_bank, "total_bank")
+        total_purchase_amount = _parse_finite_amount(
+            total_purchase_amount, "total_purchase_amount"
+        )
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
 
     # Parse date
     try:
@@ -462,6 +503,26 @@ def upload_purchase_invoice(record_id):
                 "updated_at": inv["updated_at"],
             }
             collection.update_one({"_id": obj_id}, {"$set": set_fields})
+        elif isinstance(companies, list) and len(companies) == 0 and company_index == 0:
+            # For records created without suppliers, uploading first invoice should materialize
+            # purchase_companies[0] so invoice metadata is visible in the UI.
+            collection.update_one(
+                {"_id": obj_id},
+                {
+                    "$set": {
+                        "purchase_companies": [
+                            {
+                                "purchase_company_name": (record.get("purchase_company_name") or "").strip(),
+                                "company_phone": (record.get("company_phone") or "").strip(),
+                                "purchase_invoice_filename": inv["purchase_invoice_filename"],
+                                "purchase_invoice_content_type": inv["purchase_invoice_content_type"],
+                                "purchase_invoice_data": inv["purchase_invoice_data"],
+                            }
+                        ],
+                        "updated_at": inv["updated_at"],
+                    }
+                },
+            )
         else:
             collection.update_one({"_id": obj_id}, {"$set": inv})
         updated = collection.find_one({"_id": obj_id})
@@ -500,10 +561,13 @@ def update_daily_record(record_id):
         if not update:
             return jsonify({"error": "No valid fields to update"}), 400
         
-        # Coerce numeric fields to proper types
+        # Coerce numeric fields to proper types (reject NaN / inf)
         for k in ("total_cash_sale", "total_bank", "total_purchase_amount"):
             if k in update and update[k] is not None:
-                update[k] = float(update[k])
+                try:
+                    update[k] = _parse_finite_amount(update[k], k)
+                except ValueError as ve:
+                    return jsonify({"error": str(ve)}), 400
         
         # Add updated_at timestamp
         update["updated_at"] = datetime.utcnow().isoformat()
@@ -527,6 +591,20 @@ def update_daily_record(record_id):
                 nested_patch["purchase_companies.0.purchase_company_name"] = update["purchase_company_name"]
             if "company_phone" in update:
                 nested_patch["purchase_companies.0.company_phone"] = update["company_phone"]
+        elif isinstance(pcs, list) and len(pcs) == 0 and (
+            "purchase_company_name" in update or "company_phone" in update
+        ):
+            # Record exists with explicit empty companies array. If user edits supplier info,
+            # create the first company row so frontend displays it consistently.
+            nested_patch["purchase_companies"] = [
+                {
+                    "purchase_company_name": (update.get("purchase_company_name") or "").strip(),
+                    "company_phone": (update.get("company_phone") or "").strip(),
+                    "purchase_invoice_filename": None,
+                    "purchase_invoice_content_type": None,
+                    "purchase_invoice_data": None,
+                }
+            ]
 
         all_set = {**update, **nested_patch}
 
@@ -681,13 +759,21 @@ def get_account_summary():
         
         # Convert ObjectId to string
         result = convert_objectid_to_str(result)
-        
-        # Calculate overall totals
+        for r in result:
+            if isinstance(r, dict):
+                _sanitize_daily_record_amount_fields(r)
+
+        # Calculate overall totals (NaN in DB would otherwise poison sums / JSON)
         overall_totals = {
             "total_cash_sale": sum(r.get("total_cash_sale", 0) for r in result),
             "total_bank": sum(r.get("total_bank", 0) for r in result),
             "total_purchase_amount": sum(r.get("total_purchase_amount", 0) for r in result),
-            "net_balance": sum(r.get("total_cash_sale", 0) + r.get("total_bank", 0) - r.get("total_purchase_amount", 0) for r in result)
+            "net_balance": sum(
+                r.get("total_cash_sale", 0)
+                + r.get("total_bank", 0)
+                - r.get("total_purchase_amount", 0)
+                for r in result
+            ),
         }
         
         return jsonify({
