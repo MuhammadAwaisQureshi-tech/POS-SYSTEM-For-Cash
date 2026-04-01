@@ -15,7 +15,7 @@ from typing import Any, Optional, Tuple
 
 # Invoice files stored as BSON Binary on the document (MongoDB doc limit 16MB).
 MAX_PURCHASE_INVOICE_BYTES = 10 * 1024 * 1024
-ALLOWED_INVOICE_EXTENSIONS = {".pdf"}
+ALLOWED_INVOICE_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 # Create a Blueprint for account analysis routes
 account_analysis_bp = Blueprint('account_analysis', __name__)
@@ -230,7 +230,7 @@ def create_daily_record():
     
     Accepts application/json or multipart/form-data.
     For multiple suppliers, send purchase_companies as a JSON array string and optional files
-    purchase_invoice_0, purchase_invoice_1, ... (PDF only, max 10MB each).
+    purchase_invoice_0, purchase_invoice_1, ... (PDF/image, max 10MB each).
     Legacy single-row multipart may use purchase_invoice for the first row only.
     """
     payload = {}
