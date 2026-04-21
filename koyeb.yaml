@@ -1,0 +1,19 @@
+# Koyeb configuration file
+# This file configures how Koyeb builds and runs your application
+
+build:
+  # Build command (if needed)
+  # Koyeb will auto-detect Python and install dependencies from requirements.txt
+  
+run:
+  # Run command for Flask application using gunicorn
+  command: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 3 --keep-alive 5
+
+env:
+  # Environment variables will be set in Koyeb dashboard
+  # Required variables:
+  # - SUPABASE_URL
+  # - SUPABASE_SERVICE_ROLE_KEY
+  # - DATABASE_URL (optional, for Supabase PostgreSQL)
+  # - PORT (automatically set by Koyeb)
+
