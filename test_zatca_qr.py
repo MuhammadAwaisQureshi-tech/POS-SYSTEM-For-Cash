@@ -24,7 +24,7 @@ def test_qr_generation():
     print("=" * 60)
     
     # Sample invoice data
-    seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+    seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
     vat_number = "314265267200003"
     invoice_datetime = format_datetime(datetime.now())
     total_amount = format_amount(1000.50)
