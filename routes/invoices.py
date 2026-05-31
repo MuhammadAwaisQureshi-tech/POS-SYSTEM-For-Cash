@@ -6,12 +6,22 @@ from flask import Blueprint, request, jsonify
 from mongodb_client import get_collection
 from zatca_qr import generate_zatca_qr, format_amount, format_datetime
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from bson import ObjectId
 from typing import Any
 import json
 
 # Create a Blueprint for invoice routes
 invoices_bp = Blueprint('invoices', __name__)
+
+# MongoDB collection for on-account / credit sales (name as requested)
+CREDIT_INVOICE_COLLECTION = "credit invoice"
+CREDIT_INVOICE_TZ = ZoneInfo("Asia/Riyadh")
+
+
+def now_saudi() -> datetime:
+    """Current time in Saudi Arabia (used for credit invoice timestamps)."""
+    return datetime.now(CREDIT_INVOICE_TZ)
 
 
 def convert_objectid_to_str(obj: Any) -> Any:
@@ -262,7 +272,7 @@ def create_invoice():
         # Generate ZATCA QR code
         try:
             # ZATCA Phase-1 required data
-            seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
             vat_number = "314265267200003"
             invoice_datetime = format_datetime(now)
             total_amount_str = format_amount(total_amount)
@@ -312,7 +322,7 @@ def list_invoices():
         invoices = list(collection.find().sort("created_at", -1))
         
         # ZATCA Phase-1 required data (fixed for this company)
-        seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+        seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
         vat_number = "314265267200003"
         
         result = []
@@ -374,7 +384,7 @@ def get_invoice_qr(invoice_id):
 
         try:
             # ZATCA Phase-1 required data
-            seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
             vat_number = "314265267200003"
             created_at = datetime.fromisoformat(invoice.get("created_at", "").replace("Z", ""))
             invoice_datetime = format_datetime(created_at)
@@ -599,7 +609,7 @@ def create_invoice_cash():
         # Generate ZATCA QR code
         try:
             # ZATCA Phase-1 required data
-            seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
             vat_number = "314265267200003"
             invoice_datetime = format_datetime(now)
             total_amount_str = format_amount(total_amount)
@@ -649,7 +659,7 @@ def list_invoices_cash():
         invoices = list(collection.find().sort("created_at", -1))
         
         # ZATCA Phase-1 required data (fixed for this company)
-        seller_name = "مؤسسة وثبة العز لقطع غيار التكييف والتبريد"
+        seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
         vat_number = "314265267200003"
         
         result = []
@@ -714,3 +724,324 @@ def delete_invoice_cash(invoice_id):
     except Exception as e:
         error_msg = str(e)
         return jsonify({"error": f"Failed to delete invoice: {error_msg}"}), 500
+
+
+def _credit_balance_base(d: dict) -> float:
+    """
+    Amount owed on credit before VAT (payments apply to this base).
+    Prefers stored amount_without_vat; otherwise total - vat_amount (legacy rows).
+    """
+    raw = d.get("amount_without_vat")
+    if raw is not None:
+        try:
+            return max(0.0, round(float(raw), 4))
+        except (TypeError, ValueError):
+            pass
+    try:
+        t = float(d.get("total", d.get("total_amount", 0)) or 0)
+        v = float(d.get("vat_amount", 0) or 0)
+        return max(0.0, round(t - v, 4))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _enrich_credit_invoice_dict(invoice_dict: dict) -> dict:
+    """Ensure amount_without_vat, pending_amount, received_amount for API consumers."""
+    balance_base = _credit_balance_base(invoice_dict)
+    if invoice_dict.get("amount_without_vat") is None:
+        invoice_dict["amount_without_vat"] = balance_base
+    try:
+        received = float(invoice_dict.get("received_amount", 0) or 0)
+    except (TypeError, ValueError):
+        received = 0.0
+    pending_raw = invoice_dict.get("pending_amount")
+    if pending_raw is None:
+        pending = max(0.0, round(balance_base - received, 4))
+    else:
+        try:
+            pending = float(pending_raw)
+        except (TypeError, ValueError):
+            pending = max(0.0, round(balance_base - received, 4))
+    invoice_dict["received_amount"] = round(received, 4)
+    invoice_dict["pending_amount"] = round(pending, 4)
+    return invoice_dict
+
+
+@invoices_bp.post("/api/credit-invoices")
+def create_credit_invoice():
+    """
+    Create a credit (on-account) invoice in the `credit invoice` MongoDB collection.
+    Tracks received_amount (payments so far) and pending_amount (balance due).
+    """
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    invoice_no = (payload or {}).get("invoice_no")
+    customer_name = (payload or {}).get("customer_name")
+    items = (payload or {}).get("items", [])
+    total_amount = (payload or {}).get("total_amount")
+
+    user_id = (payload or {}).get("user_id", "")
+    if not user_id:
+        return jsonify({"error": "user_id is required. Please ensure you are logged in."}), 400
+
+    customer_phone = (payload or {}).get("customer_phone", "")
+    customer_vat_id = (payload or {}).get("customer_vat_id", "")
+    customer_address = (payload or {}).get("customer_address", "")
+    quotation_price = (payload or {}).get("quotation_price", "")
+    subtotal = (payload or {}).get("subtotal", 0.0)
+    discount = (payload or {}).get("discount", 0.0)
+    vat_amount = (payload or {}).get("vat_amount", 0.0)
+    amount_without_vat_raw = (payload or {}).get("amount_without_vat")
+    currency = (payload or {}).get("currency", "SAR")
+    notes = (payload or {}).get("notes", "")
+    receiver_name = (payload or {}).get("receiver_name", "")
+    cashier_name = (payload or {}).get("cashier_name", "")
+
+    if not invoice_no:
+        return jsonify({"error": "invoice_no is required"}), 400
+    if not customer_name:
+        return jsonify({"error": "customer_name is required"}), 400
+    if not items or not isinstance(items, list):
+        return jsonify({"error": "items must be a non-empty array"}), 400
+
+    try:
+        total_amount = float(total_amount) if total_amount is not None else 0.0
+        subtotal = float(subtotal) if subtotal is not None else 0.0
+        discount = float(discount) if discount is not None else 0.0
+        vat_amount = float(vat_amount) if vat_amount is not None else 0.0
+        if amount_without_vat_raw is not None and amount_without_vat_raw != "":
+            amount_without_vat = float(amount_without_vat_raw)
+        else:
+            amount_without_vat = max(0.0, round(total_amount - vat_amount, 4))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Amounts must be valid numbers"}), 400
+
+    now = now_saudi()
+    received_amount = 0.0
+    pending_amount = max(0.0, round(amount_without_vat - received_amount, 4))
+
+    invoice_doc = {
+        "invoice_no": invoice_no,
+        "user_id": user_id,
+        "customer_name": customer_name,
+        "customer_phone": customer_phone,
+        "customer_vat_id": customer_vat_id,
+        "customer_address": customer_address,
+        "quotation_price": quotation_price,
+        "items": items,
+        "subtotal": subtotal,
+        "discount": discount,
+        "vat_amount": vat_amount,
+        "total": total_amount,
+        "total_amount": total_amount,
+        "amount_without_vat": amount_without_vat,
+        "currency": currency,
+        "notes": notes,
+        "receiver_name": receiver_name,
+        "cashier_name": cashier_name,
+        "is_credit": True,
+        "received_amount": received_amount,
+        "pending_amount": pending_amount,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+
+    try:
+        collection = get_collection(CREDIT_INVOICE_COLLECTION)
+        result = collection.insert_one(invoice_doc)
+
+        if not result.inserted_id:
+            return jsonify({"error": "Failed to create credit invoice"}), 500
+
+        created_invoice = collection.find_one({"_id": result.inserted_id})
+
+        try:
+            if customer_name:
+                customers_collection = get_collection("customers")
+                now_iso = now.isoformat()
+                existing_customer = customers_collection.find_one({
+                    "customer_name": customer_name,
+                    "user_id": user_id
+                })
+                customer_doc = {
+                    "user_id": user_id,
+                    "customer_name": customer_name,
+                    "customer_phone": customer_phone,
+                    "customer_vat_id": customer_vat_id,
+                    "customer_address": customer_address,
+                    "updated_at": now_iso
+                }
+                if existing_customer:
+                    customers_collection.update_one(
+                        {"_id": existing_customer.get("_id")},
+                        {"$set": customer_doc}
+                    )
+                else:
+                    customer_doc["created_at"] = now_iso
+                    customers_collection.insert_one(customer_doc)
+        except Exception as e:
+            print(f"Warning: Error saving customer information: {str(e)}")
+
+        try:
+            success, errors = update_product_quantities(items)
+            if not success and errors:
+                print(f"Warning: Some product quantities could not be updated: {errors}")
+        except Exception as e:
+            print(f"Warning: Error updating product quantities: {str(e)}")
+
+        try:
+            seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
+            vat_number = "314265267200003"
+            invoice_datetime = format_datetime(now)
+            total_amount_str = format_amount(total_amount)
+            vat_amount_str = format_amount(vat_amount)
+
+            qr_code = generate_zatca_qr(
+                seller_name=seller_name,
+                vat_number=vat_number,
+                invoice_datetime=invoice_datetime,
+                total_amount=total_amount_str,
+                vat_amount=vat_amount_str
+            )
+            collection.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"qr_code": qr_code}}
+            )
+            created_invoice["qr_code"] = qr_code
+        except Exception as e:
+            print(f"Warning: Failed to generate QR code: {str(e)}")
+            created_invoice["qr_code"] = None
+
+        created_invoice = convert_objectid_to_str(created_invoice)
+        created_invoice = _enrich_credit_invoice_dict(created_invoice)
+        return jsonify(created_invoice), 201
+
+    except Exception as e:
+        error_msg = str(e)
+        return jsonify({"error": f"Failed to create credit invoice: {error_msg}"}), 500
+
+
+@invoices_bp.get("/api/credit-invoices")
+def list_credit_invoices():
+    """List all credit invoices from the `credit invoice` collection."""
+    try:
+        collection = get_collection(CREDIT_INVOICE_COLLECTION)
+        invoices = list(collection.find().sort("created_at", -1))
+
+        seller_name = "Zahid POS System لقطع غيار التكييف والتبريد"
+        vat_number = "314265267200003"
+
+        result = []
+        for invoice in invoices:
+            invoice_dict = convert_objectid_to_str(invoice)
+            invoice_dict = _enrich_credit_invoice_dict(invoice_dict)
+
+            if not invoice_dict.get("qr_code"):
+                try:
+                    created_at = datetime.fromisoformat(
+                        invoice_dict.get("created_at", "").replace("Z", "")
+                    )
+                    invoice_datetime = format_datetime(created_at)
+                    total_amount_str = format_amount(
+                        float(invoice_dict.get("total", invoice_dict.get("total_amount", 0)))
+                    )
+                    vat_amount_str = format_amount(float(invoice_dict.get("vat_amount", 0)))
+
+                    qr_code = generate_zatca_qr(
+                        seller_name=seller_name,
+                        vat_number=vat_number,
+                        invoice_datetime=invoice_datetime,
+                        total_amount=total_amount_str,
+                        vat_amount=vat_amount_str
+                    )
+                    invoice_dict["qr_code"] = qr_code
+                except Exception as e:
+                    print(f"Warning: Failed to generate QR code for credit invoice {invoice_dict.get('id')}: {str(e)}")
+                    invoice_dict["qr_code"] = None
+
+            result.append(invoice_dict)
+
+        return jsonify(result)
+    except Exception as e:
+        error_msg = str(e)
+        return jsonify({"error": f"Failed to fetch credit invoices: {error_msg}"}), 500
+
+
+@invoices_bp.patch("/api/credit-invoices/<invoice_id>")
+def record_credit_invoice_payment(invoice_id):
+    """
+    Record a payment against a credit invoice.
+    Body JSON: { "payment_amount": number } — added to received_amount; pending_amount is updated.
+    """
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    try:
+        payment_amount = float(payload.get("payment_amount", 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "payment_amount must be a number"}), 400
+
+    if payment_amount <= 0:
+        return jsonify({"error": "payment_amount must be greater than zero"}), 400
+
+    try:
+        collection = get_collection(CREDIT_INVOICE_COLLECTION)
+        try:
+            obj_id = ObjectId(invoice_id)
+            doc = collection.find_one({"_id": obj_id})
+        except Exception:
+            doc = collection.find_one({"$or": [{"id": invoice_id}, {"_id": invoice_id}]})
+
+        if not doc:
+            return jsonify({"error": "Credit invoice not found"}), 404
+
+        balance_base = _credit_balance_base(doc)
+        try:
+            received = float(doc.get("received_amount", 0) or 0)
+        except (TypeError, ValueError):
+            received = 0.0
+
+        new_received = min(balance_base, round(received + payment_amount, 4))
+        new_pending = max(0.0, round(balance_base - new_received, 4))
+        now_iso = now_saudi().isoformat()
+
+        collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {
+                "received_amount": new_received,
+                "pending_amount": new_pending,
+                "updated_at": now_iso,
+            }}
+        )
+        updated = collection.find_one({"_id": doc["_id"]})
+        updated = convert_objectid_to_str(updated)
+        updated = _enrich_credit_invoice_dict(updated)
+        return jsonify(updated), 200
+    except Exception as e:
+        error_msg = str(e)
+        return jsonify({"error": f"Failed to update credit invoice: {error_msg}"}), 500
+
+
+@invoices_bp.delete("/api/credit-invoices/<invoice_id>")
+def delete_credit_invoice(invoice_id):
+    """Delete a credit invoice by ID."""
+    try:
+        collection = get_collection(CREDIT_INVOICE_COLLECTION)
+        try:
+            obj_id = ObjectId(invoice_id)
+            result = collection.delete_one({"_id": obj_id})
+        except Exception:
+            result = collection.delete_one({"$or": [{"id": invoice_id}, {"_id": invoice_id}]})
+
+        if result.deleted_count == 0:
+            return jsonify({"error": "Credit invoice not found"}), 404
+
+        return jsonify({"message": "Credit invoice deleted successfully"}), 200
+    except Exception as e:
+        error_msg = str(e)
+        return jsonify({"error": f"Failed to delete credit invoice: {error_msg}"}), 500
