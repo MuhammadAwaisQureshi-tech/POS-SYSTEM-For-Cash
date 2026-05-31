@@ -1,15 +1,19 @@
 """
 Google Drive helpers for purchase invoice storage.
 Used by account analysis API and the upload_data1_to_drive CLI.
+
+Token source: MongoDB collection  `google_drive_token`  (single document).
+When the access token is refreshed the updated values are written back to
+that same document so it stays current across restarts.
 """
 import mimetypes
 import os
 import uuid
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
-from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -18,56 +22,111 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 BASE_DIR = Path(__file__).resolve().parent.parent
-TOKEN_FILE = BASE_DIR / "google_drive_token.json"
 PURCHASE_INVOICE_FOLDER_NAME = "Purchase_invoice"
+_MONGO_TOKEN_COLLECTION = "google_drive_token"
 
 
-def _first_env(*keys: str, default: str = "") -> str:
-    for key in keys:
-        value = os.getenv(key)
-        if value:
-            return value.strip()
-    return default
+# ---------------------------------------------------------------------------
+# MongoDB token helpers
+# ---------------------------------------------------------------------------
 
+def _load_token_from_mongo() -> Optional[dict]:
+    """Return the first document from the google_drive_token collection, or None."""
+    try:
+        from mongodb_client import get_collection  # local import to avoid circular dep
+        col = get_collection(_MONGO_TOKEN_COLLECTION)
+        return col.find_one({}, {"_id": 0})
+    except Exception as exc:
+        raise RuntimeError(f"Could not read Google Drive token from MongoDB: {exc}") from exc
+
+
+def _save_token_to_mongo(creds: Credentials) -> None:
+    """Persist refreshed credentials back to the MongoDB token document."""
+    try:
+        from mongodb_client import get_collection
+        col = get_collection(_MONGO_TOKEN_COLLECTION)
+        expiry_str = (
+            creds.expiry.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+            if creds.expiry
+            else None
+        )
+        update_fields = {
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": list(creds.scopes) if creds.scopes else [],
+            "expiry": expiry_str,
+        }
+        col.update_one({}, {"$set": update_fields}, upsert=True)
+    except Exception as exc:
+        # Non-fatal — the service call can still proceed with in-memory creds
+        print(f"[google_drive] Warning: could not persist refreshed token to MongoDB: {exc}")
+
+
+def _creds_from_mongo_doc(doc: dict) -> Credentials:
+    """Build a google.oauth2.credentials.Credentials object from a MongoDB token doc."""
+    expiry = None
+    if doc.get("expiry"):
+        try:
+            expiry_str = doc["expiry"].rstrip("Z")
+            # Google auth library compares expiry against offset-naive utcnow(),
+            # so we must store it as naive UTC (no tzinfo).
+            expiry = datetime.fromisoformat(expiry_str).replace(tzinfo=None)
+        except ValueError:
+            pass
+
+    return Credentials(
+        token=doc.get("token"),
+        refresh_token=doc.get("refresh_token"),
+        token_uri=doc.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=doc.get("client_id"),
+        client_secret=doc.get("client_secret"),
+        scopes=doc.get("scopes", SCOPES),
+        expiry=expiry,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def get_drive_service():
-    load_dotenv(BASE_DIR / ".env")
-
-    client_id = _first_env("GOOGLE_CLIENT_ID", "client_ID", "CLIENT_ID")
-    client_secret = _first_env("GOOGLE_CLIENT_SECRET", "Client_Secret", "CLIENT_SECRET")
-
-    if not client_id or not client_secret:
+    """Return an authorised Google Drive v3 service using credentials from MongoDB."""
+    doc = _load_token_from_mongo()
+    if not doc:
         raise RuntimeError(
-            "Missing Google credentials in .env. Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET "
-            "(or existing client_ID/Client_Secret)."
+            "No Google Drive token document found in MongoDB collection "
+            f"'{_MONGO_TOKEN_COLLECTION}'. Please insert the token document first."
         )
 
-    creds = None
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    creds = _creds_from_mongo_doc(doc)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            _save_token_to_mongo(creds)
         else:
             raise RuntimeError(
-                "Google Drive is not authorized. Run: python upload_data1_to_drive.py "
-                "(from the backend folder) once to create google_drive_token.json."
+                "Google Drive credentials are invalid and cannot be refreshed. "
+                "Please update the token document in MongoDB."
             )
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
     return build("drive", "v3", credentials=creds)
 
 
 def authorize_drive_interactive() -> None:
-    """First-time OAuth (browser). Used by upload_data1_to_drive.py CLI only."""
-    load_dotenv(BASE_DIR / ".env")
-    client_id = _first_env("GOOGLE_CLIENT_ID", "client_ID", "CLIENT_ID")
-    client_secret = _first_env("GOOGLE_CLIENT_SECRET", "Client_Secret", "CLIENT_SECRET")
+    """First-time OAuth (browser). Saves resulting token to MongoDB."""
+    doc = _load_token_from_mongo()
+    client_id = (doc or {}).get("client_id", "")
+    client_secret = (doc or {}).get("client_secret", "")
+
     if not client_id or not client_secret:
         raise RuntimeError(
-            "Missing Google credentials in .env. Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET."
+            "client_id / client_secret not found in MongoDB token document."
         )
+
     client_config = {
         "installed": {
             "client_id": client_id,
@@ -84,7 +143,7 @@ def authorize_drive_interactive() -> None:
         authorization_prompt_message="Open this URL in your browser: {url}",
         success_message="Authentication complete. You can close this tab.",
     )
-    TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+    _save_token_to_mongo(creds)
 
 
 def _escape_drive_query_literal(value: str) -> str:
