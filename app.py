@@ -9,7 +9,7 @@ import os
 import atexit
 from dotenv import load_dotenv
 from database import init_db
-from routes import products, invoices, debug, auth, purchase_products, company_settings, customers
+from routes import products, invoices, debug, auth, purchase_products, company_settings, customers, ocr, account_analysis, extra_expense
 from mongodb_client import close_mongodb_client
 
 # Load environment variables at module level (before app creation)
@@ -119,6 +119,9 @@ def create_app():
     app.register_blueprint(purchase_products.purchase_products_bp)
     app.register_blueprint(company_settings.company_settings_bp)
     app.register_blueprint(customers.customers_bp)
+    app.register_blueprint(ocr.ocr_bp)
+    app.register_blueprint(account_analysis.account_analysis_bp)
+    app.register_blueprint(extra_expense.extra_expense_bp)
     
     # Register shutdown handler to close MongoDB connection
     @app.teardown_appcontext
